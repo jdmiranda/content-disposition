@@ -22,6 +22,48 @@ module.exports.parse = parse
 var basename = require('path').basename
 
 /**
+ * Cache for encoded parameter values
+ * @private
+ */
+
+var encodingCache = new Map()
+var CACHE_SIZE_LIMIT = 1000
+
+/**
+ * Pre-computed percent encoding lookup table for common special characters
+ * @private
+ */
+
+var PERCENT_ENCODE_LOOKUP = {
+  ' ': '%20',
+  '!': '%21',
+  '"': '%22',
+  '#': '%23',
+  '$': '%24',
+  '%': '%25',
+  '&': '%26',
+  "'": '%27',
+  '(': '%28',
+  ')': '%29',
+  '*': '%2A',
+  '+': '%2B',
+  ',': '%2C',
+  '/': '%2F',
+  ':': '%3A',
+  ';': '%3B',
+  '<': '%3C',
+  '=': '%3D',
+  '>': '%3E',
+  '?': '%3F',
+  '@': '%40',
+  '[': '%5B',
+  '\\': '%5C',
+  ']': '%5D',
+  '{': '%7B',
+  '}': '%7D'
+}
+
+/**
  * RegExp to match non attr-char, *after* encodeURIComponent (i.e. not including "%")
  * @private
  */
@@ -146,6 +188,15 @@ function contentDisposition (filename, options) {
   // get type
   var type = opts.type || 'attachment'
 
+  // fast path: no filename means simple attachment/inline
+  if (filename === undefined) {
+    // validate and normalize type
+    if (!type || typeof type !== 'string' || !TOKEN_REGEXP.test(type)) {
+      throw new TypeError('invalid type')
+    }
+    return String(type).toLowerCase()
+  }
+
   // get parameters
   var params = createparams(filename, opts.fallback)
 
@@ -189,8 +240,9 @@ function createparams (filename, fallback) {
   // restrict to file base name
   var name = basename(filename)
 
-  // determine if name is suitable for quoted string
+  // determine if name is suitable for quoted string and check for hex escape in one pass
   var isQuotedString = TEXT_REGEXP.test(name)
+  var hasHexEscape = HEX_ESCAPE_REGEXP.test(name)
 
   // generate fallback name
   var fallbackName = typeof fallback !== 'string'
@@ -199,7 +251,7 @@ function createparams (filename, fallback) {
   var hasFallback = typeof fallbackName === 'string' && fallbackName !== name
 
   // set extended filename parameter
-  if (hasFallback || !isQuotedString || HEX_ESCAPE_REGEXP.test(name)) {
+  if (hasFallback || !isQuotedString || hasHexEscape) {
     params['filename*'] = name
   }
 
@@ -234,20 +286,23 @@ function format (obj) {
   // start with normalized type
   var string = String(type).toLowerCase()
 
+  // fast path: no parameters
+  if (!parameters || typeof parameters !== 'object') {
+    return string
+  }
+
   // append parameters
-  if (parameters && typeof parameters === 'object') {
-    var param
-    var params = Object.keys(parameters).sort()
+  var param
+  var params = Object.keys(parameters).sort()
 
-    for (var i = 0; i < params.length; i++) {
-      param = params[i]
+  for (var i = 0; i < params.length; i++) {
+    param = params[i]
 
-      var val = param.slice(-1) === '*'
-        ? ustring(parameters[param])
-        : qstring(parameters[param])
+    var val = param.slice(-1) === '*'
+      ? ustring(parameters[param])
+      : qstring(parameters[param])
 
-      string += '; ' + param + '=' + val
-    }
+    string += '; ' + param + '=' + val
   }
 
   return string
@@ -272,19 +327,16 @@ function decodefield (str) {
   var encoded = match[2]
   var value
 
-  // to binary string
-  var binary = encoded.replace(HEX_ESCAPE_REPLACE_REGEXP, pdecode)
-
-  switch (charset) {
-    case 'iso-8859-1':
-      value = getlatin1(binary)
-      break
-    case 'utf-8':
-    case 'utf8':
-      value = Buffer.from(binary, 'binary').toString('utf8')
-      break
-    default:
-      throw new TypeError('unsupported charset in extended field')
+  // fast path for utf-8 (most common case)
+  if (charset === 'utf-8' || charset === 'utf8') {
+    // to binary string
+    var binary = encoded.replace(HEX_ESCAPE_REPLACE_REGEXP, pdecode)
+    value = Buffer.from(binary, 'binary').toString('utf8')
+  } else if (charset === 'iso-8859-1') {
+    var binary = encoded.replace(HEX_ESCAPE_REPLACE_REGEXP, pdecode)
+    value = getlatin1(binary)
+  } else {
+    throw new TypeError('unsupported charset in extended field')
   }
 
   return value
@@ -405,6 +457,13 @@ function pdecode (str, hex) {
  */
 
 function pencode (char) {
+  // use lookup table for common characters
+  var lookup = PERCENT_ENCODE_LOOKUP[char]
+  if (lookup !== undefined) {
+    return lookup
+  }
+
+  // fallback to computation for other characters
   return '%' + String(char)
     .charCodeAt(0)
     .toString(16)
@@ -436,11 +495,24 @@ function qstring (val) {
 function ustring (val) {
   var str = String(val)
 
+  // check cache first
+  var cached = encodingCache.get(str)
+  if (cached !== undefined) {
+    return cached
+  }
+
   // percent encode as UTF-8
   var encoded = encodeURIComponent(str)
     .replace(ENCODE_URL_ATTR_CHAR_REGEXP, pencode)
 
-  return 'UTF-8\'\'' + encoded
+  var result = 'UTF-8\'\'' + encoded
+
+  // cache the result (with size limit to prevent memory issues)
+  if (encodingCache.size < CACHE_SIZE_LIMIT) {
+    encodingCache.set(str, result)
+  }
+
+  return result
 }
 
 /**
